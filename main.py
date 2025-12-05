@@ -160,7 +160,7 @@ async def auth():
 
 @app.api_route("/", methods=["GET"], include_in_schema=False)
 async def index():
-    return {"HIFI-API": "v1.0", "Repo": "https://github.com/sachinsenal0x64/hifi"}
+    return {"HIFI-API": "v1.0", "Repo": "https://github.com/uimaxbai/hifi-api"}
 
 """
 Tidal Hi-Res streams are only avaliable over MPEG-DASH.
@@ -193,8 +193,8 @@ async def get_hi_res(
         async with httpx.AsyncClient(http2=True) as client:
             track_data = await client.get(url=track_url, headers=payload)
             final_data = track_data.json()
-            decode_manifest = base64.b64decode(final_data["manifest"]) # returns dash
-            return Response(content=decode_manifest, media_type=final_data["manifestMimeType"])
+            # decode_manifest = base64.b64decode(final_data["manifest"]) # returns dash
+            return Response(content=final_data, media_type="application/json")
     except KeyError:
         raise HTTPException(
             status_code=404,
