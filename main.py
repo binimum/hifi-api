@@ -385,28 +385,30 @@ async def get_artist(
 
         return {"version": API_VERSION, "artist": artist_data, "cover": cover}
 
-    artist_page_url = (
-        "https://api.tidal.com/v1/pages/single-module-page/"
-        "ae223310-a4c2-4568-a770-ffef70344441/4/a4f964ba-b52e-41e8-b25c-06cd70c1efad/2"
-    )
-    artist_page_url += f"?artistId={f}&countryCode=US&deviceType=BROWSER"
+    # Fetch albums and singles/EPs directly in parallel
+    albums_url = f"https://api.tidal.com/v1/artists/{f}/albums"
+    common_params = {"countryCode": "US", "limit": 100}
 
-    page_data, token, cred = await authed_get_json(
-        artist_page_url,
-        token=token,
-        cred=cred,
+    results = await asyncio.gather(
+        authed_get_json(albums_url, params=common_params, token=token, cred=cred),
+        authed_get_json(albums_url, params={**common_params, "filter": "EPSANDSINGLES"}, token=token, cred=cred),
+        return_exceptions=True
     )
 
-    album_ids: List[int] = []
-    for row in page_data.get("rows", []):
-        for module in row.get("modules", []):
-            paged = module.get("pagedList") or {}
-            for item in paged.get("items", []):
-                album_id = item.get("id")
-                if album_id:
-                    album_ids.append(album_id)
+    unique_releases = []
+    seen_ids = set()
+    for res in results:
+        if isinstance(res, tuple) and len(res) > 0:
+            data, token, cred = res # Update tokens from latest responses
+            for item in data.get("items", []):
+                if item.get("id") and item["id"] not in seen_ids:
+                    unique_releases.append(item)
+                    seen_ids.add(item["id"])
+        elif isinstance(res, Exception):
+            print(f"Error fetching artist releases: {res}")
 
-    album_ids = list(dict.fromkeys(album_ids))  # preserve order, dedupe
+    album_ids: List[int] = [item["id"] for item in unique_releases]
+    page_data = {"items": unique_releases}
 
     if not album_ids:
         return {"version": API_VERSION, "albums": page_data, "tracks": []}
