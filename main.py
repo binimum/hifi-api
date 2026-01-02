@@ -317,6 +317,23 @@ async def get_album(id: int):
     return await make_request(url, params={"limit": 100, "countryCode": "US"})
 
 
+@app.get("/mix/")
+async def get_mix(
+    id: str = Query(..., description="Mix ID"),
+    country_code: str = Query("US", description="Country Code"),
+):
+    """Fetch items from a Tidal mix by its ID."""
+    token, cred = await get_tidal_token_for_cred()
+    url = f"https://api.tidal.com/v1/mixes/{id}/items"
+    data, _, _ = await authed_get_json(
+        url,
+        params={"countryCode": country_code},
+        token=token,
+        cred=cred,
+    )
+    return {"version": API_VERSION, "items": data.get("items", [])}
+
+
 @app.get("/playlist/")
 async def get_playlist(id: str = Query(..., min_length=1), limit: int = Query(100, ge=1, le=500)):
     """Fetch playlist metadata plus items concurrently, using shared client and single token."""
@@ -346,6 +363,46 @@ async def get_playlist(id: str = Query(..., min_length=1), limit: int = Query(10
         "playlist": playlist_data,
         "items": items_data.get("items", items_data),
     }
+
+
+@app.get("/artist/similar/")
+async def get_similar_artists(
+    id: int = Query(..., description="Artist ID"),
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """Fetch artists similar to another by its ID."""
+    token, cred = await get_tidal_token_for_cred()
+    
+    url = f"https://api.tidal.com/v1/artists/{id}/similar"
+    params = {
+        "limit": limit,
+        "offset": offset,
+        "countryCode": "US"
+    }
+    
+    data, _, _ = await authed_get_json(url, params=params, token=token, cred=cred)
+    return {"version": API_VERSION, "artists": data.get("items", [])}
+
+
+@app.get("/album/similar/")
+async def get_similar_albums(
+    id: int = Query(..., description="Album ID"),
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """Fetch albums similar to another by its ID."""
+    token, cred = await get_tidal_token_for_cred()
+    
+    url = f"https://api.tidal.com/v1/albums/{id}/similar"
+    params = {
+        "limit": limit,
+        "offset": offset,
+        "countryCode": "US"
+    }
+    
+    data, _, _ = await authed_get_json(url, params=params, token=token, cred=cred)
+    return {"version": API_VERSION, "albums": data.get("items", [])}
 
 
 @app.get("/artist/")
