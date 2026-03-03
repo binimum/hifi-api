@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+API_VERSION = "2.6"
+
 # Shared HTTP client is created in app lifespan for connection reuse
 _http_client: Optional[httpx.AsyncClient] = None
 _http_client_lock = asyncio.Lock()
@@ -56,8 +58,6 @@ async def lifespan(app: FastAPI):
         if _http_client:
             await _http_client.aclose()
             _http_client = None
-
-API_VERSION = "2.5"
 
 app = FastAPI(
     title="HiFi-RestAPI",
@@ -299,40 +299,42 @@ async def search(
     al: Union[str, None] = Query(default=None),
     v: Union[str, None] = Query(default=None),
     p: Union[str, None] = Query(default=None),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=25, ge=1, le=500),
 ):
     """Search endpoint supporting track/artist/album/video/playlist queries via distinct params."""
     queries = (
         (s, "https://api.tidal.com/v1/search/tracks", {
             "query": s,
-            "limit": 25,
-            "offset": 0,
+            "limit": limit,
+            "offset": offset,
             "countryCode": COUNTRY_CODE,
         }),
         (a, "https://api.tidal.com/v1/search/top-hits", {
             "query": a,
-            "limit": 25,
-            "offset": 0,
+            "limit": limit,
+            "offset": offset,
             "types": "ARTISTS,TRACKS",
             "countryCode": COUNTRY_CODE,
         }),
         (al, "https://api.tidal.com/v1/search/top-hits", {
             "query": al,
-            "limit": 25,
-            "offset": 0,
+            "limit": limit,
+            "offset": offset,
             "types": "ALBUMS",
             "countryCode": COUNTRY_CODE,
         }),
         (v, "https://api.tidal.com/v1/search/top-hits", {
             "query": v,
-            "limit": 25,
-            "offset": 0,
+            "limit": limit,
+            "offset": offset,
             "types": "VIDEOS",
             "countryCode": COUNTRY_CODE,
         }),
         (p, "https://api.tidal.com/v1/search/top-hits", {
             "query": p,
-            "limit": 25,
-            "offset": 0,
+            "limit": limit,
+            "offset": offset,
             "types": "PLAYLISTS",
             "countryCode": COUNTRY_CODE,
         }),
