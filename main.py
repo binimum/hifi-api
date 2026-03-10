@@ -299,10 +299,42 @@ async def search(
     al: Union[str, None] = Query(default=None),
     v: Union[str, None] = Query(default=None),
     p: Union[str, None] = Query(default=None),
+    i: Union[str, None] = Query(default=None, description="ISRC query"),
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=25, ge=1, le=500),
 ):
     """Search endpoint supporting track/artist/album/video/playlist queries via distinct params."""
+    if i:
+        response = await make_request(
+            "https://api.tidal.com/v1/tracks",
+            params={
+                "filter[isrc]": i,
+                "limit": limit,
+                "offset": offset,
+                "countryCode": COUNTRY_CODE,
+            },
+        )
+
+        # Fallback for environments where /tracks filter is unavailable.
+        if isinstance(response, dict):
+            payload = response.get("data")
+            if isinstance(payload, dict):
+                items = payload.get("items", [])
+                if isinstance(items, list) and len(items) > 0:
+                    return response
+            elif isinstance(payload, list) and len(payload) > 0:
+                return response
+
+        return await make_request(
+            "https://api.tidal.com/v1/search/tracks",
+            params={
+                "query": i,
+                "limit": limit,
+                "offset": offset,
+                "countryCode": COUNTRY_CODE,
+            },
+        )
+
     queries = (
         (s, "https://api.tidal.com/v1/search/tracks", {
             "query": s,
@@ -344,7 +376,7 @@ async def search(
         if value:
             return await make_request(url, params=params)
 
-    raise HTTPException(status_code=400, detail="Provide one of s, a, al, v, or p")
+    raise HTTPException(status_code=400, detail="Provide one of s, a, al, v, p, or i")
 
 @app.get("/album/")
 async def get_album(

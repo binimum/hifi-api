@@ -331,6 +331,7 @@ Specify only one of the following query fields:
 - `al`: `str` - album query
 - `v`: `str` - video query
 - `p`: `str` - playlist query
+- `i`: `str` - ISRC query (exact lookup via `/v1/tracks?filter[isrc]`)
 
 Pagination:
 
