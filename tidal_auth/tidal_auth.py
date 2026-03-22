@@ -181,7 +181,7 @@ async def main():
         rich.print(accs)
         acs_tok = access_token
 
-        url3 = f"https://api.tidal.com/v1/tracks/286266926/playbackinfopostpaywall?countryCode=en_US&audioquality={HI_RES}&playbackmode=STREAM&assetpresentation=FULL"
+        url3 = f"https://api.tidal.com/v1/tracks/493546859/playbackinfopostpaywall?countryCode=en_US&audioquality={HI_RES}&playbackmode=STREAM&assetpresentation=FULL"
 
         headers = {"authorization": f"Bearer {acs_tok}"}
 
