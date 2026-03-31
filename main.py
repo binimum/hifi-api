@@ -43,7 +43,7 @@ _last_known_good_proxy: Optional[str] = None
 
 def _build_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
     return httpx.AsyncClient(
-        proxy=proxy_url,
+        proxies=proxy_url,
         http2=True,
         timeout=httpx.Timeout(connect=3.0, read=12.0, write=8.0, pool=12.0),
         limits=httpx.Limits(
