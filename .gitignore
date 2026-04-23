@@ -1,5 +1,6 @@
 proxies.txt
 compose.yml
+auth.db
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
