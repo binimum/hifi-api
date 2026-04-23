@@ -3,8 +3,12 @@ import asyncio
 import json
 import os
 import random
+import secrets
+import sqlite3
+import string
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Union
 
 import httpx
@@ -12,6 +16,8 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 import logging
 
@@ -68,6 +74,8 @@ def _build_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _http_client
+    if ENABLE_AUTH:
+        init_db()
     if DEV_MODE:
         logger.warning("DEV_MODE is enabled — upstream responses will be logged at DEBUG level")
     if _http_client is None:
@@ -162,6 +170,8 @@ def _tidal_headers(extra: dict | None = None) -> dict:
 _TIDAL_DEFAULT_HEADERS = _tidal_headers()
 
 DEV_MODE = os.getenv("DEV_MODE", "False").lower() in ("true", "1", "yes")
+ENABLE_AUTH = os.getenv("ENABLE_AUTH", "False").lower() in ("true", "1", "yes")
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
 
 _RATE_LIMIT_MAX_RETRIES = 3
 _RATE_LIMIT_BASE_DELAY = 1.0
@@ -1246,6 +1256,144 @@ async def get_video(
     )
 
     return {"version": API_VERSION, "video": data}
+
+
+if ENABLE_AUTH:
+    _DB_PATH = "auth.db"
+    _db_lock = asyncio.Lock()
+
+    def _get_db() -> sqlite3.Connection:
+        conn = sqlite3.connect(_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_db():
+        conn = _get_db()
+        try:
+            conn.execute("""CREATE TABLE IF NOT EXISTS invite_codes (
+                code TEXT PRIMARY KEY,
+                used INTEGER DEFAULT 0,
+                created_at TEXT
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT UNIQUE,
+                created_at TEXT
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER,
+                created_at TEXT,
+                last_seen TEXT
+            )""")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _AUTH_EXEMPT_PATHS = {"/auth/redeem", "/admin/invite"}
+
+    @app.middleware("http")
+    async def auth_middleware(request: Request, call_next):
+        if request.method == "OPTIONS" or request.url.path in _AUTH_EXEMPT_PATHS:
+            return await call_next(request)
+
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+        token = auth_header[7:]
+        now = datetime.now(timezone.utc).isoformat()
+        user_id = None
+
+        async with _db_lock:
+            conn = _get_db()
+            try:
+                row = conn.execute(
+                    "SELECT user_id FROM sessions WHERE token = ?", (token,)
+                ).fetchone()
+                if row:
+                    conn.execute(
+                        "UPDATE sessions SET last_seen = ? WHERE token = ?", (now, token)
+                    )
+                    conn.commit()
+                    user_id = row["user_id"]
+            finally:
+                conn.close()
+
+        if user_id is None:
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+        request.state.user_id = user_id
+        return await call_next(request)
+
+    class _RedeemRequest(BaseModel):
+        invite_code: str
+        username: str
+
+    def _generate_invite_code() -> str:
+        chars = string.ascii_uppercase + string.digits
+        part1 = "".join(secrets.choice(chars) for _ in range(4))
+        part2 = "".join(secrets.choice(chars) for _ in range(4))
+        return f"HIFI-{part1}-{part2}"
+
+    @app.post("/auth/redeem")
+    async def redeem_invite(body: _RedeemRequest):
+        now = datetime.now(timezone.utc).isoformat()
+        token = None
+
+        async with _db_lock:
+            conn = _get_db()
+            try:
+                code_row = conn.execute(
+                    "SELECT used FROM invite_codes WHERE code = ?", (body.invite_code,)
+                ).fetchone()
+                if not code_row or code_row["used"]:
+                    raise HTTPException(status_code=400, detail="Invalid or already-used invite code")
+
+                user_row = conn.execute(
+                    "SELECT id FROM users WHERE username = ?", (body.username,)
+                ).fetchone()
+                if user_row:
+                    raise HTTPException(status_code=400, detail="Username already taken")
+
+                conn.execute("UPDATE invite_codes SET used = 1 WHERE code = ?", (body.invite_code,))
+                conn.execute(
+                    "INSERT INTO users (username, created_at) VALUES (?, ?)", (body.username, now)
+                )
+                user_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                token = secrets.token_hex(32)
+                conn.execute(
+                    "INSERT INTO sessions (token, user_id, created_at, last_seen) VALUES (?, ?, ?, ?)",
+                    (token, user_id, now, now),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        return {"token": token}
+
+    @app.post("/admin/invite")
+    async def create_invite(request: Request):
+        if not ADMIN_SECRET:
+            raise HTTPException(status_code=500, detail="ADMIN_SECRET not configured")
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer ") or auth_header[7:] != ADMIN_SECRET:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        now = datetime.now(timezone.utc).isoformat()
+        code = _generate_invite_code()
+
+        async with _db_lock:
+            conn = _get_db()
+            try:
+                conn.execute(
+                    "INSERT INTO invite_codes (code, created_at) VALUES (?, ?)", (code, now)
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        return {"code": code}
 
 
 if __name__ == "__main__":
