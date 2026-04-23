@@ -23,8 +23,19 @@ Install main API dependencies with `pip install -r requirements.txt` in the proj
 You can configure the application using environment variables or an `.env` file. See `.env.example` for a template.
 
 **Authentication (optional):**
-- `ENABLE_AUTH` (default: `False`): Set to `True` to enable invite-code authentication. When enabled, all API routes require a valid Bearer token and two new endpoints are registered: `POST /auth/redeem` and `POST /admin/invite`.
-- `ADMIN_SECRET`: A secret string used to authenticate calls to `POST /admin/invite` for generating invite codes.
+- `ENABLE_AUTH` (default: `False`): Set to `True` to enable invite-code authentication. When enabled, all API routes require a valid `Authorization: Bearer <token>` header and two new endpoints are registered.
+- `ADMIN_SECRET`: A secret string of your choosing, set in `.env` or as an environment variable. Used to authenticate admin calls that generate invite codes.
+
+**Auth workflow:**
+
+1. The admin generates an invite code by calling `POST /admin/invite` with `Authorization: Bearer <ADMIN_SECRET>`. A code in the format `HIFI-XXXX-XXXX` is returned and stored in `auth.db`.
+2. A user redeems the code by calling `POST /auth/redeem` with a JSON body containing their chosen `username` and the `invite_code`. The code is marked as used and a 64-character hex session token is returned.
+3. The user includes that token as `Authorization: Bearer <token>` on all subsequent requests.
+
+All data is stored in `auth.db` (SQLite) in the project root:
+- `invite_codes`; the code, whether it has been used, and when it was created
+- `users`; the user ID, username, and signup timestamp
+- `sessions`; the session token, which user it belongs to, when it was created, and when it was last seen
 
 > [!NOTE]
 > If you are running the API in Docker and enabling `ENABLE_AUTH`, run `docker-compose build --no-cache` before starting the container. Skipping this can cause conflicts if `auth.db` was previously created outside the container.
