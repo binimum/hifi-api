@@ -22,6 +22,13 @@ Install main API dependencies with `pip install -r requirements.txt` in the proj
 
 You can configure the application using environment variables or an `.env` file. See `.env.example` for a template.
 
+**Authentication (optional):**
+- `ENABLE_AUTH` (default: `False`): Set to `True` to enable invite-code authentication. When enabled, all API routes require a valid Bearer token and two new endpoints are registered: `POST /auth/redeem` and `POST /admin/invite`.
+- `ADMIN_SECRET`: A secret string used to authenticate calls to `POST /admin/invite` for generating invite codes.
+
+> [!NOTE]
+> If you are running the API in Docker and enabling `ENABLE_AUTH`, run `docker-compose build --no-cache` before starting the container. Skipping this can cause conflicts if `auth.db` was previously created outside the container.
+
 **Proxy Configuration:**
 - `USE_PROXIES` (default: `False`): Set to `True` to enable proxy support.
 - `PROXIES_FILE` (default: `proxies.txt`): Path to a text file containing a list of proxies (one per line). Format: `http(s)://user:pass@hostname:port`
