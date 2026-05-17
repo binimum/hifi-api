@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import random
 import webbrowser
 from pathlib import Path
 import base64
@@ -10,30 +9,16 @@ import httpx
 import rich
 
 TOKEN_FILE = Path(os.getenv("TOKEN_FILE", Path(__file__).resolve().parent.parent / "token.json"))
-
-_USER_AGENTS = [
-    "Dalvik/2.1.0 (Linux; U; Android 14; SM-S928B Build/AP2A.240905.003)",
-    "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 8 Pro Build/AP2A.240905.003)",
-    "Dalvik/2.1.0 (Linux; U; Android 14; SM-G998B Build/UP1A.231005.007)",
-    "Dalvik/2.1.0 (Linux; U; Android 13; SM-A546B Build/TP1A.220624.014)",
-    "Dalvik/2.1.0 (Linux; U; Android 13; Pixel 7 Build/TQ3A.230901.001)",
-    "Dalvik/2.1.0 (Linux; U; Android 13; SM-S911B Build/TP1A.220624.014)",
-    "Dalvik/2.1.0 (Linux; U; Android 12; SM-G991B Build/SP1A.210812.016)",
-    "Dalvik/2.1.0 (Linux; U; Android 12; Pixel 6 Build/SP2A.220405.004)",
-    "Dalvik/2.1.0 (Linux; U; Android 14; OnePlus CPH2423 Build/AP2A.240905.003)",
-    "Dalvik/2.1.0 (Linux; U; Android 13; moto g84 5G Build/U1TDS33.73-27)",
-]
-
-_custom_ua = os.getenv("USER_AGENT")
+USER_AGENT = os.getenv("USER_AGENT", "okhttp/5.3.2")
 
 
-def _random_ua() -> str:
-    return _custom_ua if _custom_ua else random.choice(_USER_AGENTS)
-
-
-CLIENT_ID = base64.b64decode("ZlgySnhkbW50WldLMGl4VA==").decode("iso-8859-1")
-CLIENT_SECRET = base64.b64decode(
+AUTH_CLIENT_ID = base64.b64decode("ZlgySnhkbW50WldLMGl4VA==").decode("iso-8859-1")
+AUTH_CLIENT_SECRET = base64.b64decode(
     "MU5tNUFmREFqeHJnSkZKYktOV0xlQXlLR1ZHbUlOdVhQUExIVlhBdnhBZz0=",
+).decode("iso-8859-1")
+REQUEST_CLIENT_ID = base64.b64decode("bHczdlI2R0UxdnROQnNqdg==").decode("iso-8859-1")
+REQUEST_CLIENT_SECRET = base64.b64decode(
+    "WTh0SXBxS0p4czlCRUl3WXIwSTliU2JNV0Rzb2dYSng5TGFOM21DSHdENCUzRA==",
 ).decode("iso-8859-1")
 
 class Hifi:
@@ -57,7 +42,7 @@ class Auth(Hifi):
     async def get_auth_response(self):
         data = {"client_id": self.client_id, "scope": self.scope}
         headers = {
-            "User-Agent": _random_ua(),
+            "User-Agent": USER_AGENT,
             "Accept": "application/json",
             "Accept-Encoding": "gzip",
             "Accept-Language": "en-US,en;q=0.9",
@@ -96,7 +81,7 @@ def save_token_entry(entry):
 
 async def poll_for_authorization(url, data, auth):
     headers = {
-        "User-Agent": _random_ua(),
+        "User-Agent": USER_AGENT,
         "Accept": "application/json",
         "Accept-Encoding": "gzip",
         "Accept-Language": "en-US,en;q=0.9",
@@ -109,67 +94,24 @@ async def poll_for_authorization(url, data, auth):
                 return response.json()
             await asyncio.sleep(5)
 
-
-async def fetch_credentials():
-    url = "https://api.github.com/gists/48d01f5a24b4b7b37f19443977c22cd6"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        gist_data = resp.json()
-        
-        content_str = gist_data["files"]["tidal-api-key.json"]["content"]
-        keys_data = json.loads(content_str)
-        
-        hifi_creds = [
-            (CLIENT_ID, CLIENT_SECRET)
-        ]
-        other_creds = []
-        
-        for key_entry in keys_data["keys"]:
-            if key_entry.get("valid") == "True":
-                cred = (key_entry["clientId"], key_entry["clientSecret"])
-                if "hifi" in key_entry.get("formats", "").lower():
-                    hifi_creds.append(cred)
-                else:
-                    other_creds.append(cred)
-        
-        if not hifi_creds and not other_creds:
-            raise Exception("No valid Tidal credentials found in Gist")
-        return hifi_creds, other_creds
-
-
 async def main():
-    hifi_creds, other_creds = await fetch_credentials()
-    random.shuffle(hifi_creds)
-    random.shuffle(other_creds)
-    all_creds = hifi_creds + other_creds
-
     async def run_link_flow():
-        authrize = None
-        for client_id, client_secret in all_creds:
-            rich.print(f"Trying Client ID: {client_id}")
-            authrize = Auth(
-                client_id=client_id,
-                scope="r_usr+w_usr+w_sub",
-                url="https://auth.tidal.com/v1/oauth2/device_authorization",
-                client_secret=client_secret,
-            )
+        rich.print(f"Trying Client ID: {AUTH_CLIENT_ID}")
+        authrize = Auth(
+            client_id=AUTH_CLIENT_ID,
+            scope="r_usr+w_usr+w_sub",
+            url="https://auth.tidal.com/v1/oauth2/device_authorization",
+            client_secret=AUTH_CLIENT_SECRET,
+        )
 
-            try:
-                await authrize.get_auth_response()
-                if authrize.response.status_code == 200:
-                    break
-                elif authrize.response.status_code == 401:
-                    rich.print(f"[yellow]Client ID {client_id} failed with 401. Trying next...[/yellow]")
-                    continue
-                else:
-                    rich.print(f"[red]Error {authrize.response.status_code}. Trying next...[/red]")
-                    continue
-            except Exception as e:
-                rich.print(f"[red]Exception: {e}. Trying next...[/red]")
-                continue
-        else:
-            rich.print("[red]All tokens failed.[/red]")
+        try:
+            await authrize.get_auth_response()
+        except Exception as e:
+            rich.print(f"[red]Exception: {e}.[/red]")
+            return False
+
+        if authrize.response.status_code != 200:
+            rich.print(f"[red]Error {authrize.response.status_code}.[/red]")
             return False
 
         res = authrize.response.json()
@@ -205,8 +147,8 @@ async def main():
             "access_token": access_token,
             "refresh_token": refresh_token,
             "userID": user_id,
-            "client_ID": client_id,
-            "client_secret": client_secret,
+            "client_ID": REQUEST_CLIENT_ID,
+            "client_secret": REQUEST_CLIENT_SECRET,
         }
         save_token_entry(accs)
         rich.print(accs)
@@ -216,7 +158,7 @@ async def main():
 
         headers = {
             "authorization": f"Bearer {acs_tok}",
-            "User-Agent": _random_ua(),
+            "User-Agent": USER_AGENT,
             "Accept": "application/json",
             "Accept-Encoding": "gzip",
             "Accept-Language": "en-US,en;q=0.9",
