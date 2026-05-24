@@ -23,6 +23,7 @@ API_VERSION = "2.10"
 
 # Shared HTTP client is created in app lifespan for connection reuse
 _http_client: Optional[httpx.AsyncClient] = None
+_http_client_proxy_url: Optional[str] = None
 _http_client_lock = asyncio.Lock()
 
 # One lock per credential to avoid global contention during token refreshes
@@ -65,9 +66,18 @@ def _build_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
         return httpx.AsyncClient(proxies=legacy_proxies, **client_kwargs)
 
 
+def _build_proxy_test_client(proxy_url: str) -> httpx.AsyncClient:
+    try:
+        # Modern httpx
+        return httpx.AsyncClient(proxy=proxy_url, timeout=5.0)
+    except TypeError:
+        # Legacy httpx
+        return httpx.AsyncClient(proxies={"all://": proxy_url}, timeout=5.0)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _http_client
+    global _http_client, _http_client_proxy_url
     if DEV_MODE:
         logger.warning("DEV_MODE is enabled — upstream responses will be logged at DEBUG level")
     if _http_client is None:
@@ -80,12 +90,14 @@ async def lifespan(app: FastAPI):
             elif not proxy_url and FALLBACK_TO_DIRECT_CONNECTION:
                 logger.warning("Could not find a working proxy, falling back to direct connection. HOST IP MAY BE EXPOSED!")
         _http_client = _build_http_client(proxy_url)
+        _http_client_proxy_url = proxy_url
     try:
         yield
     finally:
         if _http_client:
             await _http_client.aclose()
             _http_client = None
+            _http_client_proxy_url = None
 
 app = FastAPI(
     title="HiFi-RestAPI",
@@ -177,7 +189,7 @@ def load_proxies():
 
 async def test_proxy(proxy_url: str) -> bool:
     try:
-        async with httpx.AsyncClient(proxy=proxy_url, timeout=5.0) as client:
+        async with _build_proxy_test_client(proxy_url) as client:
             resp = await client.get("http://example.com")
             return resp.status_code == 200
     except Exception:
@@ -237,11 +249,11 @@ async def _delayed_close(client: httpx.AsyncClient):
     await client.aclose()
 
 async def update_global_client(force_new_proxy: bool = False):
-    global _http_client
+    global _http_client, _http_client_proxy_url
     async with _http_client_lock:
         proxy_to_avoid = None
-        if force_new_proxy and _http_client and _http_client.proxy:
-            proxy_to_avoid = str(_http_client.proxy.url)
+        if force_new_proxy and _http_client_proxy_url:
+            proxy_to_avoid = _http_client_proxy_url
 
         proxy_url = None
         if USE_PROXIES:
@@ -254,15 +266,13 @@ async def update_global_client(force_new_proxy: bool = False):
                     raise HTTPException(status_code=503, detail="Service Unavailable")
 
         # Only create a new client if the proxy is actually different
-        current_proxy_url: Optional[str] = None
-        if _http_client and _http_client.proxy:
-            current_proxy_url = str(_http_client.proxy.url)
-        if _http_client and current_proxy_url == proxy_url:
+        if _http_client and _http_client_proxy_url == proxy_url:
             return
 
         new_client = _build_http_client(proxy_url)
         old_client = _http_client
         _http_client = new_client
+        _http_client_proxy_url = proxy_url
 
         if old_client is not None:
             asyncio.create_task(_delayed_close(old_client))
@@ -326,7 +336,7 @@ def _lock_for_cred(cred: dict) -> asyncio.Lock:
 
 
 async def get_http_client() -> httpx.AsyncClient:
-    global _http_client
+    global _http_client, _http_client_proxy_url
     if _http_client is None:
         async with _http_client_lock:
             if _http_client is None:
@@ -338,6 +348,7 @@ async def get_http_client() -> httpx.AsyncClient:
                     elif not proxy_url and FALLBACK_TO_DIRECT_CONNECTION:
                         logger.warning("Could not find a working proxy, falling back to direct connection. HOST IP MAY BE EXPOSED!")
                 _http_client = _build_http_client(proxy_url)
+                _http_client_proxy_url = proxy_url
     return _http_client
 
 
