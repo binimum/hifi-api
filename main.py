@@ -43,7 +43,6 @@ _last_known_good_proxy: Optional[str] = None
 
 
 def _build_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
-    # Pack common settings into a dictionary to keep things DRY
     client_kwargs = {
         "http2": True,
         "headers": _tidal_headers(),
@@ -56,22 +55,16 @@ def _build_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
     }
 
     try:
-        # Modern httpx
         return httpx.AsyncClient(proxy=proxy_url, **client_kwargs)
     except TypeError:
-        # Legacy httpx
-        # If proxy_url is None, proxies=None is perfectly valid.
-        # If it's a string, older httpx versions require it to be a dictionary mapping.
         legacy_proxies = {"all://": proxy_url} if proxy_url else None
         return httpx.AsyncClient(proxies=legacy_proxies, **client_kwargs)
 
 
 def _build_proxy_test_client(proxy_url: str) -> httpx.AsyncClient:
     try:
-        # Modern httpx
         return httpx.AsyncClient(proxy=proxy_url, timeout=5.0)
     except TypeError:
-        # Legacy httpx
         return httpx.AsyncClient(proxies={"all://": proxy_url}, timeout=5.0)
 
 
@@ -115,7 +108,6 @@ app.add_middleware(
 )
 
 
-# Config (defaults act as fallback if token file missing)
 CLIENT_ID = os.getenv("CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
 REFRESH_TOKEN: Optional[str] = os.getenv("REFRESH_TOKEN")
@@ -127,9 +119,7 @@ USE_PROXIES = os.getenv("USE_PROXIES", "False").lower() in ("true", "1", "yes")
 ROTATE_PROXIES_ON_REFRESH = os.getenv("ROTATE_PROXIES_ON_REFRESH", "False").lower() in ("true", "1", "yes")
 PROXIES_FILE = os.getenv("PROXIES_FILE", "proxies.txt")
 FALLBACK_TO_DIRECT_CONNECTION = os.getenv("FALLBACK_TO_DIRECT_CONNECTION", "False").lower() in ("true", "1", "yes")
-# Maximum number of proxy candidates to test per get_working_proxy() call
 MAX_PROXY_CANDIDATES = 10
-# Maximum number of concurrent proxy tests inside get_working_proxy()
 _PROXY_TEST_CONCURRENCY = 5
 _max_retries_raw = os.getenv("MAX_RETRIES", "2")
 USER_AGENT = os.getenv("USER_AGENT", "okhttp/5.3.2")
@@ -175,8 +165,8 @@ except ValueError:
     MAX_RETRIES = 2
 if MAX_RETRIES < 1:
     MAX_RETRIES = 1
+
 def load_proxies():
-    """Load proxies from file into the global _proxies list."""
     global _proxies
     if not os.path.exists(PROXIES_FILE):
         logger.warning(f"Proxies file {PROXIES_FILE} not found.")
@@ -202,7 +192,6 @@ async def get_working_proxy(avoid_proxy: Optional[str] = None) -> Optional[str]:
     if not _proxies:
         return None
 
-    # Try the cached proxy first (unless it is the one we want to avoid)
     if _last_known_good_proxy and _last_known_good_proxy != avoid_proxy:
         if await test_proxy(_last_known_good_proxy):
             return _last_known_good_proxy
@@ -217,12 +206,10 @@ async def get_working_proxy(avoid_proxy: Optional[str] = None) -> Optional[str]:
     else:
         candidate_proxies = shuffled_proxies
 
-    # Exclude the already-tested cached proxy and cap the candidate list
     if _last_known_good_proxy:
         candidate_proxies = [p for p in candidate_proxies if p != _last_known_good_proxy]
     candidate_proxies = candidate_proxies[:MAX_PROXY_CANDIDATES]
 
-    # Test candidates concurrently, returning the first one that succeeds
     sem = asyncio.Semaphore(_PROXY_TEST_CONCURRENCY)
     found_event = asyncio.Event()
     selected_proxy: List[Optional[str]] = [None]
@@ -265,7 +252,6 @@ async def update_global_client(force_new_proxy: bool = False):
                     logger.error("Could not find a working proxy and FALLBACK_TO_DIRECT_CONNECTION is False.")
                     raise HTTPException(status_code=503, detail="Service Unavailable")
 
-        # Only create a new client if the proxy is actually different
         if _http_client and _http_client_proxy_url == proxy_url:
             return
 
@@ -293,14 +279,12 @@ if os.path.exists(TOKEN_FILE):
                 "client_secret": entry.get("client_secret") or CLIENT_SECRET,
                 "refresh_token": entry.get("refresh_token") or REFRESH_TOKEN,
                 "user_id": entry.get("userID") or USER_ID,
-                # Access tokens in file have unknown expiry; force refresh on first use
                 "access_token": None,
                 "expires_at": 0,
             }
             if cred["refresh_token"]:
                 _creds.append(cred)
 
-# Add env var credential if available and unique (simple check)
 if REFRESH_TOKEN:
     env_cred = {
         "client_id": CLIENT_ID,
@@ -310,7 +294,6 @@ if REFRESH_TOKEN:
         "access_token": None,
         "expires_at": 0,
     }
-    # Avoid adding duplicate if it was already loaded from file with same refresh token
     if not any(c["refresh_token"] == REFRESH_TOKEN for c in _creds):
         _creds.append(env_cred)
 
@@ -353,7 +336,6 @@ async def get_http_client() -> httpx.AsyncClient:
 
 
 async def refresh_tidal_token(cred: Optional[dict] = None):
-    """Refresh a token for the provided credential set."""
     cred = cred or _pick_credential()
 
     async with _lock_for_cred(cred):
@@ -416,7 +398,6 @@ async def get_tidal_token(force_refresh: bool = False):
 
 
 async def get_tidal_token_for_cred(force_refresh: bool = False, cred: Optional[dict] = None):
-    """Retrieve an access token for a specific credential; pick random if not provided."""
     cred = cred or _pick_credential()
 
     if not force_refresh and cred["access_token"] and time.time() < cred["expires_at"]:
@@ -490,8 +471,6 @@ async def authed_get_json(
     token: Optional[str] = None,
     cred: Optional[dict] = None,
 ):
-    """Perform an authenticated GET, retrying once on 401. Returns payload with updated token/cred."""
-
     if token is None:
         token, cred = await get_tidal_token_for_cred(cred=cred)
 
@@ -575,12 +554,17 @@ async def get_track_manifests(
     request: Request,
     formats: List[str] = Query(default=["HEAACV1", "AACLC", "FLAC", "FLAC_HIRES", "EAC3_JOC"]),
     adaptive: str = Query(default="true"),
+    # BTS = Bearer Token Stream = HLS delivery — returns a direct .m3u8 URL instead of
+    # base64-encoded MPEG-DASH XML. TIDAL's v1 /playbackinfo uses MPEG_DASH which silently
+    # downgrades to AAC for many client IDs; BTS via openapi.tidal.com/v2 honours the
+    # requested format (FLAC_HIRES, FLAC, etc.) correctly.
     manifestType: str = Query(default="BTS"),
     uriScheme: str = Query(default="HTTPS"),
     usage: str = Query(default="PLAYBACK")
 ):
     url = f"https://openapi.tidal.com/v2/trackManifests/{id}"
     params = [
+        ("countryCode", COUNTRY_CODE),
         ("adaptive", adaptive),
         ("manifestType", manifestType),
         ("uriScheme", uriScheme),
@@ -622,12 +606,14 @@ async def widevine_proxy(request: Request):
             resp = await client.request(request.method, url, headers=headers, content=body)
             _log_response(f"{request.method} (retry)", url, resp)
 
+        import fastapi
         return fastapi.Response(
             content=resp.content,
             status_code=resp.status_code,
             headers={"Content-Type": resp.headers.get("Content-Type", "application/json")}
         )
     except Exception as e:
+        import fastapi
         raise fastapi.HTTPException(status_code=502, detail="Error communicating with widevine server")
 
 
@@ -649,7 +635,6 @@ async def search(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=25, ge=1, le=500),
 ):
-    """Search endpoint supporting track/artist/album/video/playlist queries via distinct params."""
     isrc_query = i.strip() if isinstance(i, str) else None
     if isrc_query:
         return await make_request(
@@ -762,7 +747,6 @@ async def get_album(
 async def get_mix(
     id: str = Query(..., description="Mix ID")
 ):
-    """Fetch items from a Tidal mix by its ID."""
     token, cred = await get_tidal_token_for_cred()
     url = "https://api.tidal.com/v1/pages/mix"
     params = {
@@ -804,8 +788,6 @@ async def get_playlist(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
-    """Fetch playlist metadata plus items concurrently, using shared client and single token."""
-
     token, cred = await get_tidal_token_for_cred()
 
     playlist_url = f"https://api.tidal.com/v1/playlists/{id}"
@@ -833,7 +815,6 @@ async def get_playlist(
 
 
 def _extract_uuid_from_tidal_url(href: str) -> Optional[str]:
-    """Extract and reconstruct a hyphenated UUID from a Tidal resource URL."""
     parts = href.split("/") if href else []
     return "-".join(parts[4:9]) if len(parts) >= 9 else None
 
@@ -843,7 +824,6 @@ async def get_similar_artists(
     id: int = Query(..., description="Artist ID"),
     cursor: Union[int, str, None] = None
 ):
-    """Fetch artists similar to another by its ID using V2 API."""
     url = f"https://openapi.tidal.com/v2/artists/{id}/relationships/similarArtists"
     params = {
         "page[cursor]": cursor,
@@ -886,7 +866,6 @@ async def get_similar_albums(
     id: int = Query(..., description="Album ID"),
     cursor: Union[int, str, None] = None
 ):
-    """Fetch albums similar to another by its ID using V2 API."""
     url = f"https://openapi.tidal.com/v2/albums/{id}/relationships/similarAlbums"
     params = {
         "page[cursor]": cursor,
@@ -941,13 +920,6 @@ async def get_artist(
     f: Optional[int] = Query(default=None),
     skip_tracks: bool = Query(default=False),
 ):
-    """Artist detail or album+track aggregation.
-
-    - id: basic artist metadata + cover URLs
-    - f: fetch artist albums page and aggregate tracks across albums (capped concurrency)
-    - skip_tracks: if true, returns only albums without aggregating tracks (when using 'f')
-    """
-
     if id is None and f is None:
         raise HTTPException(status_code=400, detail="Provide id or f query param")
 
@@ -980,7 +952,6 @@ async def get_artist(
 
         return {"version": API_VERSION, "artist": artist_data, "cover": cover}
 
-    # Fetch albums and singles/EPs directly in parallel
     albums_url = f"https://api.tidal.com/v1/artists/{f}/albums"
     common_params = {"countryCode": COUNTRY_CODE, "limit": 100}
 
@@ -1004,7 +975,6 @@ async def get_artist(
     unique_releases = []
     seen_ids = set()
 
-    # Process albums (first 2 results)
     for res in results[:2]:
         if isinstance(res, tuple) and len(res) > 0:
             data = res[0]
@@ -1078,8 +1048,6 @@ async def get_cover(
     id: Optional[int] = Query(default=None),
     q: Optional[str] = Query(default=None),
 ):
-    """Fetch album cover data for a track id or search query."""
-
     if id is None and q is None:
         raise HTTPException(status_code=400, detail="Provide id or q query param")
 
@@ -1168,7 +1136,6 @@ async def get_top_videos(
     limit: int = Query(default=25, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ):
-    """Fetch recommended videos from Tidal."""
     token, cred = await get_tidal_token_for_cred()
     url = "https://api.tidal.com/v1/pages/mymusic_recommended_videos"
     params = {
@@ -1218,7 +1185,6 @@ async def get_video(
     mode: str = Query(default="STREAM", description="Playback mode (STREAM, OFFLINE)"),
     presentation: str = Query(default="FULL", description="Asset presentation (FULL, PREVIEW)"),
 ):
-    """Fetch video playback info from Tidal."""
     token, cred = await get_tidal_token_for_cred()
     url = f"https://api.tidal.com/v1/videos/{id}/playbackinfo"
     params = {
