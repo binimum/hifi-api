@@ -575,7 +575,7 @@ async def get_track_manifests(
     request: Request,
     formats: List[str] = Query(default=["HEAACV1", "AACLC", "FLAC", "FLAC_HIRES", "EAC3_JOC"]),
     adaptive: str = Query(default="true"),
-    manifestType: str = Query(default="MPEG_DASH"),
+    manifestType: str = Query(default="BTS"),
     uriScheme: str = Query(default="HTTPS"),
     usage: str = Query(default="PLAYBACK")
 ):
