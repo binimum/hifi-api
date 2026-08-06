@@ -804,6 +804,7 @@ async def get_playback_request(request_id: str):
 @app.delete("/playback/requests/{request_id}")
 async def cancel_playback_request(request_id: str):
     """Cancel a pending or processing playback request and release its slot."""
+    _prune_playback_jobs()
     job = _playback_jobs.get(request_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Playback request not found or expired")

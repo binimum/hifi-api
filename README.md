@@ -31,6 +31,9 @@ You can configure the application using environment variables or an `.env` file.
 
 **Playback and catalog accounts:**
 
+For a client/agent-oriented migration guide, see
+[`docs/AGENT_INTEGRATION_CHANGES.md`](docs/AGENT_INTEGRATION_CHANGES.md).
+
 - Every playback credential is limited to one in-flight playback request. With two playback accounts, at most two playback requests run concurrently, one on each account.
 - To reserve an account for unrestricted search, album, artist, playlist, and other metadata traffic, add `"role": "catalog"` to that account's entry in `token.json`. A catalog account does not need an active subscription and is excluded from playback rotation.
 - Alternatively, configure `CATALOG_CLIENT_ID`, `CATALOG_CLIENT_SECRET`, and `CATALOG_REFRESH_TOKEN` in `.env`. `CATALOG_TOKEN` also accepts a static bearer token, but cannot refresh it automatically.
