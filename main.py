@@ -4,13 +4,16 @@ import json
 import os
 import random
 import time
+import uuid
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional, Union
+from dataclasses import dataclass
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Union
 
 import httpx
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 import logging
@@ -31,6 +34,10 @@ _refresh_locks: Dict[str, asyncio.Lock] = {}
 
 # Loaded credential set from token.json; each entry will be enriched with access cache
 _creds: List[dict] = []
+
+# Optional credential reserved for catalog/metadata traffic. It is deliberately
+# kept out of the playback pool and is not request-serialized.
+_catalog_cred: Optional[dict] = None
 
 # Global semaphore to limit concurrent album track fetches across all requests
 _album_tracks_sem = asyncio.Semaphore(20)
@@ -122,6 +129,14 @@ REFRESH_TOKEN: Optional[str] = os.getenv("REFRESH_TOKEN")
 USER_ID = os.getenv("USER_ID")
 TOKEN_FILE = os.getenv("TOKEN_FILE", "token.json")
 COUNTRY_CODE = os.getenv("COUNTRY_CODE", "US")
+
+# Catalog traffic can use either a static bearer token or a refreshable account.
+# A token.json entry with `"role": "catalog"` takes precedence over these.
+CATALOG_TOKEN = os.getenv("CATALOG_TOKEN") or os.getenv("CATALOG_ACCESS_TOKEN")
+CATALOG_CLIENT_ID = os.getenv("CATALOG_CLIENT_ID") or CLIENT_ID
+CATALOG_CLIENT_SECRET = os.getenv("CATALOG_CLIENT_SECRET") or CLIENT_SECRET
+CATALOG_REFRESH_TOKEN = os.getenv("CATALOG_REFRESH_TOKEN")
+CATALOG_USER_ID = os.getenv("CATALOG_USER_ID")
 
 USE_PROXIES = os.getenv("USE_PROXIES", "False").lower() in ("true", "1", "yes")
 ROTATE_PROXIES_ON_REFRESH = os.getenv("ROTATE_PROXIES_ON_REFRESH", "False").lower() in ("true", "1", "yes")
@@ -288,6 +303,7 @@ if os.path.exists(TOKEN_FILE):
             token_data = [token_data]
 
         for entry in token_data:
+            is_catalog = entry.get("role") == "catalog" or entry.get("catalog") is True
             cred = {
                 "client_id": entry.get("client_ID") or CLIENT_ID,
                 "client_secret": entry.get("client_secret") or CLIENT_SECRET,
@@ -298,7 +314,13 @@ if os.path.exists(TOKEN_FILE):
                 "expires_at": 0,
             }
             if cred["refresh_token"]:
-                _creds.append(cred)
+                if is_catalog:
+                    if _catalog_cred is None:
+                        _catalog_cred = cred
+                    else:
+                        logger.warning("Ignoring additional catalog credential in %s", TOKEN_FILE)
+                elif not any(c["refresh_token"] == cred["refresh_token"] for c in _creds):
+                    _creds.append(cred)
 
 # Add env var credential if available and unique (simple check)
 if REFRESH_TOKEN:
@@ -313,6 +335,24 @@ if REFRESH_TOKEN:
     # Avoid adding duplicate if it was already loaded from file with same refresh token
     if not any(c["refresh_token"] == REFRESH_TOKEN for c in _creds):
         _creds.append(env_cred)
+
+if _catalog_cred is None and CATALOG_REFRESH_TOKEN:
+    _catalog_cred = {
+        "client_id": CATALOG_CLIENT_ID,
+        "client_secret": CATALOG_CLIENT_SECRET,
+        "refresh_token": CATALOG_REFRESH_TOKEN,
+        "user_id": CATALOG_USER_ID,
+        "access_token": None,
+        "expires_at": 0,
+    }
+
+if _catalog_cred is not None:
+    # A credential explicitly reserved for catalog traffic must never also
+    # become a playback slot, even if it was duplicated via environment vars.
+    _creds[:] = [
+        cred for cred in _creds
+        if cred["refresh_token"] != _catalog_cred["refresh_token"]
+    ]
 
 if _creds:
     CLIENT_ID = _creds[0]["client_id"]
@@ -333,6 +373,159 @@ def _lock_for_cred(cred: dict) -> asyncio.Lock:
         lock = asyncio.Lock()
         _refresh_locks[key] = lock
     return lock
+
+
+class PlaybackCredentialPool:
+    """Lease each playback credential to at most one request at a time."""
+
+    def __init__(self, credentials: List[dict]):
+        self._available: asyncio.Queue[dict] = asyncio.Queue()
+        self._size = len(credentials)
+        for cred in credentials:
+            self._available.put_nowait(cred)
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    @property
+    def available(self) -> int:
+        return self._available.qsize()
+
+    def try_acquire(self) -> Optional[dict]:
+        if self._size == 0:
+            raise HTTPException(status_code=500, detail="No Tidal playback credentials available; populate token.json")
+        try:
+            return self._available.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+
+    def release(self, cred: dict) -> None:
+        self._available.put_nowait(cred)
+
+    @asynccontextmanager
+    async def lease(self) -> AsyncIterator[dict]:
+        if self._size == 0:
+            raise HTTPException(status_code=500, detail="No Tidal playback credentials available; populate token.json")
+
+        cred = await self._available.get()
+        try:
+            yield cred
+        finally:
+            self.release(cred)
+
+
+_playback_pool = PlaybackCredentialPool(_creds)
+
+
+@dataclass
+class PlaybackJob:
+    request_id: str
+    operation: Optional[Callable[[dict], Awaitable[Any]]]
+    created_at: float
+    state: str = "pending"
+    result: Any = None
+    error: Optional[str] = None
+    error_status: int = 500
+    finished_at: Optional[float] = None
+    task: Optional[asyncio.Task] = None
+
+
+_playback_jobs: Dict[str, PlaybackJob] = {}
+_PLAYBACK_JOB_TTL_SECONDS = 300
+
+
+def _prune_playback_jobs() -> None:
+    cutoff = time.time() - _PLAYBACK_JOB_TTL_SECONDS
+    expired = [
+        request_id
+        for request_id, job in _playback_jobs.items()
+        if job.finished_at is not None and job.finished_at < cutoff
+    ]
+    for request_id in expired:
+        _playback_jobs.pop(request_id, None)
+
+
+def _playback_job_position(job: PlaybackJob) -> int:
+    if job.state != "pending":
+        return 0
+    pending = [queued for queued in _playback_jobs.values() if queued.state == "pending"]
+    try:
+        return pending.index(job) + 1
+    except ValueError:
+        return 0
+
+
+def _playback_job_payload(job: PlaybackJob) -> dict:
+    status_url = f"/playback/requests/{job.request_id}"
+    return {
+        "status": job.state,
+        "requestId": job.request_id,
+        "queuePosition": _playback_job_position(job),
+        "statusUrl": status_url,
+        "cancelUrl": status_url,
+        "playbackAccounts": _playback_pool.size,
+        "activePlaybackRequests": _playback_pool.size - _playback_pool.available,
+    }
+
+
+def _pending_playback_response(job: PlaybackJob) -> JSONResponse:
+    position = _playback_job_position(job)
+    return JSONResponse(
+        status_code=202,
+        content=_playback_job_payload(job),
+        headers={
+            "Location": f"/playback/requests/{job.request_id}",
+            "Retry-After": "1",
+            "X-Playback-Queue-Position": str(position),
+            "X-Playback-Request-Id": job.request_id,
+        },
+    )
+
+
+async def _run_queued_playback_job(job: PlaybackJob) -> None:
+    try:
+        async with _playback_pool.lease() as cred:
+            job.state = "processing"
+            if job.operation is None:
+                raise RuntimeError("Playback operation is missing")
+            job.result = await job.operation(cred)
+            job.state = "completed"
+    except asyncio.CancelledError:
+        job.state = "cancelled"
+        raise
+    except HTTPException as exc:
+        job.state = "failed"
+        job.error = str(exc.detail)
+        job.error_status = exc.status_code
+    except Exception:
+        logger.exception("Queued playback request %s failed", job.request_id)
+        job.state = "failed"
+        job.error = "Playback request failed"
+        job.error_status = 500
+    finally:
+        job.finished_at = time.time()
+        job.operation = None
+
+
+async def dispatch_playback_request(operation: Callable[[dict], Awaitable[Any]]):
+    """Run immediately when possible; otherwise return a pollable 202 job."""
+    cred = _playback_pool.try_acquire()
+    if cred is not None:
+        try:
+            return await operation(cred)
+        finally:
+            _playback_pool.release(cred)
+
+    _prune_playback_jobs()
+    job = PlaybackJob(
+        request_id=uuid.uuid4().hex,
+        operation=operation,
+        created_at=time.time(),
+    )
+    _playback_jobs[job.request_id] = job
+    job.task = asyncio.create_task(_run_queued_playback_job(job))
+    return _pending_playback_response(job)
 
 
 async def get_http_client() -> httpx.AsyncClient:
@@ -426,9 +619,33 @@ async def get_tidal_token_for_cred(force_refresh: bool = False, cred: Optional[d
     return token, cred
 
 
-async def make_request(url: str, token: Optional[str] = None, params: Optional[dict] = None, cred: Optional[dict] = None):
+async def get_catalog_token_for_cred(force_refresh: bool = False, cred: Optional[dict] = None):
+    """Return the unrestricted catalog credential, falling back for compatibility."""
+    if cred is not None:
+        return await get_tidal_token_for_cred(force_refresh=force_refresh, cred=cred)
+    if _catalog_cred is not None:
+        return await get_tidal_token_for_cred(force_refresh=force_refresh, cred=_catalog_cred)
+    if CATALOG_TOKEN:
+        return CATALOG_TOKEN, None
+    return await get_tidal_token_for_cred(force_refresh=force_refresh)
+
+
+async def _get_request_token(*, catalog: bool, force_refresh: bool = False, cred: Optional[dict] = None):
+    if catalog:
+        return await get_catalog_token_for_cred(force_refresh=force_refresh, cred=cred)
+    return await get_tidal_token_for_cred(force_refresh=force_refresh, cred=cred)
+
+
+async def make_request(
+    url: str,
+    token: Optional[str] = None,
+    params: Optional[dict] = None,
+    cred: Optional[dict] = None,
+    *,
+    catalog: bool = True,
+):
     if token is None:
-        token, cred = await get_tidal_token_for_cred(cred=cred)
+        token, cred = await _get_request_token(catalog=catalog, cred=cred)
     client = await get_http_client()
     headers = {"authorization": f"Bearer {token}"}
 
@@ -438,7 +655,7 @@ async def make_request(url: str, token: Optional[str] = None, params: Optional[d
             _log_response("GET", url, resp)
 
             if resp.status_code == 401:
-                token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
+                token, cred = await _get_request_token(catalog=catalog, force_refresh=True, cred=cred)
                 headers = {"authorization": f"Bearer {token}"}
                 resp = await client.get(url, headers=headers, params=params)
                 _log_response("GET (retry after 401)", url, resp)
@@ -457,7 +674,7 @@ async def make_request(url: str, token: Optional[str] = None, params: Optional[d
                 continue
 
             if resp.status_code == 404:
-                fresh_token, fresh_cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
+                fresh_token, fresh_cred = await _get_request_token(catalog=catalog, force_refresh=True, cred=cred)
                 if fresh_token != token:
                     headers = {"authorization": f"Bearer {fresh_token}"}
                     resp = await client.get(url, headers=headers, params=params)
@@ -489,11 +706,12 @@ async def authed_get_json(
     params: Optional[dict] = None,
     token: Optional[str] = None,
     cred: Optional[dict] = None,
+    catalog: bool = True,
 ):
     """Perform an authenticated GET, retrying once on 401. Returns payload with updated token/cred."""
 
     if token is None:
-        token, cred = await get_tidal_token_for_cred(cred=cred)
+        token, cred = await _get_request_token(catalog=catalog, cred=cred)
 
     client = await get_http_client()
     headers = {"authorization": f"Bearer {token}"}
@@ -504,7 +722,7 @@ async def authed_get_json(
             _log_response("GET", url, resp)
 
             if resp.status_code == 401:
-                token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
+                token, cred = await _get_request_token(catalog=catalog, force_refresh=True, cred=cred)
                 headers["authorization"] = f"Bearer {token}"
                 resp = await client.get(url, headers=headers, params=params)
                 _log_response("GET (retry after 401)", url, resp)
@@ -523,7 +741,7 @@ async def authed_get_json(
                 continue
 
             if resp.status_code == 404:
-                fresh_token, fresh_cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
+                fresh_token, fresh_cred = await _get_request_token(catalog=catalog, force_refresh=True, cred=cred)
                 if fresh_token != token:
                     headers["authorization"] = f"Bearer {fresh_token}"
                     resp = await client.get(url, headers=headers, params=params)
@@ -548,6 +766,54 @@ async def authed_get_json(
             raise HTTPException(status_code=429, detail="Upstream timeout")
         raise HTTPException(status_code=503, detail="Connection error to Tidal")
 
+
+async def make_playback_request_for_cred(cred: dict, url: str, params: Optional[dict] = None):
+    token, cred = await get_tidal_token_for_cred(cred=cred)
+    return await make_request(url, token=token, params=params, cred=cred, catalog=False)
+
+
+async def make_playback_request(url: str, params: Optional[dict] = None):
+    """Run one complete playback operation in an exclusive account slot."""
+    async with _playback_pool.lease() as cred:
+        return await make_playback_request_for_cred(cred, url, params=params)
+
+
+@app.get("/playback/requests/{request_id}")
+async def get_playback_request(request_id: str):
+    """Poll a playback request that was accepted with HTTP 202."""
+    _prune_playback_jobs()
+    job = _playback_jobs.get(request_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Playback request not found or expired")
+
+    if job.state in ("pending", "processing"):
+        return _pending_playback_response(job)
+    if job.state == "completed":
+        return job.result
+    if job.state == "cancelled":
+        return JSONResponse(
+            status_code=410,
+            content={**_playback_job_payload(job), "detail": "Playback request was cancelled"},
+        )
+    return JSONResponse(
+        status_code=job.error_status,
+        content={**_playback_job_payload(job), "detail": job.error or "Playback request failed"},
+    )
+
+
+@app.delete("/playback/requests/{request_id}")
+async def cancel_playback_request(request_id: str):
+    """Cancel a pending or processing playback request and release its slot."""
+    job = _playback_jobs.get(request_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Playback request not found or expired")
+    if job.state in ("pending", "processing") and job.task is not None:
+        job.task.cancel()
+        job.state = "cancelled"
+        job.finished_at = time.time()
+    return _playback_job_payload(job)
+
+
 @app.get("/")
 async def index():
     return {"version": API_VERSION, "Repo": "https://github.com/binimum/hifi-api"}
@@ -566,7 +832,9 @@ async def get_track(id: int, quality: str = "HI_RES_LOSSLESS", immersiveaudio: b
         "assetpresentation": "FULL",
         "immersiveaudio": immersiveaudio
     }
-    return await make_request(track_url, params=params)
+    return await dispatch_playback_request(
+        lambda cred: make_playback_request_for_cred(cred, track_url, params=params)
+    )
 
 
 @app.get("/trackManifests/")
@@ -588,16 +856,20 @@ async def get_track_manifests(
     ]
     for f in formats:
         params.append(("formats", f))
-    res = await make_request(url, params=params)
-    try:
-        drm_data = res["data"]["data"]["attributes"]["drmData"]
-        if drm_data:
-            proxy_url = str(request.base_url).rstrip("/") + "/widevine"
-            drm_data["licenseUrl"] = proxy_url
-            drm_data["certificateUrl"] = proxy_url
-    except (KeyError, TypeError):
-        pass
-    return res
+
+    async def fetch_manifest(cred: dict):
+        res = await make_playback_request_for_cred(cred, url, params=params)
+        try:
+            drm_data = res["data"]["data"]["attributes"]["drmData"]
+            if drm_data:
+                proxy_url = str(request.base_url).rstrip("/") + "/widevine"
+                drm_data["licenseUrl"] = proxy_url
+                drm_data["certificateUrl"] = proxy_url
+        except (KeyError, TypeError):
+            pass
+        return res
+
+    return await dispatch_playback_request(fetch_manifest)
 
 # Not really necessary but I'm including it anyway
 @app.api_route("/widevine", methods=["GET", "POST"])
@@ -606,29 +878,32 @@ async def widevine_proxy(request: Request):
     body = await request.body()
     url = "https://api.tidal.com/v2/widevine"
 
-    token, cred = await get_tidal_token_for_cred()
-    headers = {
-        "authorization": f"Bearer {token}",
-        "Content-Type": request.headers.get("Content-Type", "application/octet-stream")
-    }
+    async def fetch_license(cred: dict):
+        token, cred = await get_tidal_token_for_cred(cred=cred)
+        headers = {
+            "authorization": f"Bearer {token}",
+            "Content-Type": request.headers.get("Content-Type", "application/octet-stream")
+        }
 
-    try:
-        resp = await client.request(request.method, url, headers=headers, content=body)
-        _log_response(request.method, url, resp)
-
-        if resp.status_code == 401:
-            token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
-            headers["authorization"] = f"Bearer {token}"
+        try:
             resp = await client.request(request.method, url, headers=headers, content=body)
-            _log_response(f"{request.method} (retry)", url, resp)
+            _log_response(request.method, url, resp)
 
-        return fastapi.Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers={"Content-Type": resp.headers.get("Content-Type", "application/json")}
-        )
-    except Exception as e:
-        raise fastapi.HTTPException(status_code=502, detail="Error communicating with widevine server")
+            if resp.status_code == 401:
+                token, cred = await get_tidal_token_for_cred(force_refresh=True, cred=cred)
+                headers["authorization"] = f"Bearer {token}"
+                resp = await client.request(request.method, url, headers=headers, content=body)
+                _log_response(f"{request.method} (retry)", url, resp)
+
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers={"Content-Type": resp.headers.get("Content-Type", "application/json")}
+            )
+        except Exception as e:
+            raise HTTPException(status_code=502, detail="Error communicating with widevine server") from e
+
+    return await dispatch_playback_request(fetch_license)
 
 
 @app.get("/recommendations/")
@@ -711,7 +986,7 @@ async def get_album(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
-    token, cred = await get_tidal_token_for_cred()
+    token, cred = await get_catalog_token_for_cred()
 
     album_url = f"https://api.tidal.com/v1/albums/{id}"
     items_url = f"https://api.tidal.com/v1/albums/{id}/items"
@@ -763,7 +1038,7 @@ async def get_mix(
     id: str = Query(..., description="Mix ID")
 ):
     """Fetch items from a Tidal mix by its ID."""
-    token, cred = await get_tidal_token_for_cred()
+    token, cred = await get_catalog_token_for_cred()
     url = "https://api.tidal.com/v1/pages/mix"
     params = {
         "mixId": id,
@@ -806,7 +1081,7 @@ async def get_playlist(
 ):
     """Fetch playlist metadata plus items concurrently, using shared client and single token."""
 
-    token, cred = await get_tidal_token_for_cred()
+    token, cred = await get_catalog_token_for_cred()
 
     playlist_url = f"https://api.tidal.com/v1/playlists/{id}"
     items_url = f"https://api.tidal.com/v1/playlists/{id}/items"
@@ -951,7 +1226,7 @@ async def get_artist(
     if id is None and f is None:
         raise HTTPException(status_code=400, detail="Provide id or f query param")
 
-    token, cred = await get_tidal_token_for_cred()
+    token, cred = await get_catalog_token_for_cred()
 
     if id is not None:
         artist_url = f"https://api.tidal.com/v1/artists/{id}"
@@ -1083,7 +1358,7 @@ async def get_cover(
     if id is None and q is None:
         raise HTTPException(status_code=400, detail="Provide id or q query param")
 
-    token, cred = await get_tidal_token_for_cred()
+    token, cred = await get_catalog_token_for_cred()
 
     def build_cover_entry(cover_slug: str, name: Optional[str], track_id: Optional[int]):
         slug = cover_slug.replace("-", "/")
@@ -1169,7 +1444,7 @@ async def get_top_videos(
     offset: int = Query(default=0, ge=0),
 ):
     """Fetch recommended videos from Tidal."""
-    token, cred = await get_tidal_token_for_cred()
+    token, cred = await get_catalog_token_for_cred()
     url = "https://api.tidal.com/v1/pages/mymusic_recommended_videos"
     params = {
         "countryCode": countryCode,
@@ -1219,7 +1494,6 @@ async def get_video(
     presentation: str = Query(default="FULL", description="Asset presentation (FULL, PREVIEW)"),
 ):
     """Fetch video playback info from Tidal."""
-    token, cred = await get_tidal_token_for_cred()
     url = f"https://api.tidal.com/v1/videos/{id}/playbackinfo"
     params = {
         "videoquality": quality,
@@ -1227,14 +1501,18 @@ async def get_video(
         "assetpresentation": presentation,
     }
 
-    data, token, cred = await authed_get_json(
-        url,
-        params=params,
-        token=token,
-        cred=cred,
-    )
+    async def fetch_video(cred: dict):
+        token, cred = await get_tidal_token_for_cred(cred=cred)
+        data, token, cred = await authed_get_json(
+            url,
+            params=params,
+            token=token,
+            cred=cred,
+            catalog=False,
+        )
+        return {"version": API_VERSION, "video": data}
 
-    return {"version": API_VERSION, "video": data}
+    return await dispatch_playback_request(fetch_video)
 
 
 if __name__ == "__main__":

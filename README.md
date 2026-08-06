@@ -29,6 +29,59 @@ You can configure the application using environment variables or an `.env` file.
 - `MAX_RETRIES` (default: `2`): Number of times to retry a request with a new proxy if the current one fails.
 - `FALLBACK_TO_DIRECT_CONNECTION` (default: `False`): **WARNING:** If set to `True`, the app will expose the host IP if all proxies fail or `proxies.txt` is misconfigured.
 
+**Playback and catalog accounts:**
+
+- Every playback credential is limited to one in-flight playback request. With two playback accounts, at most two playback requests run concurrently, one on each account.
+- To reserve an account for unrestricted search, album, artist, playlist, and other metadata traffic, add `"role": "catalog"` to that account's entry in `token.json`. A catalog account does not need an active subscription and is excluded from playback rotation.
+- Alternatively, configure `CATALOG_CLIENT_ID`, `CATALOG_CLIENT_SECRET`, and `CATALOG_REFRESH_TOKEN` in `.env`. `CATALOG_TOKEN` also accepts a static bearer token, but cannot refresh it automatically.
+
+If all playback accounts are occupied, playback endpoints return `202 Accepted` immediately instead of silently holding the HTTP request:
+
+```json
+{
+  "status": "pending",
+  "requestId": "f1b5...",
+  "queuePosition": 2,
+  "statusUrl": "/playback/requests/f1b5...",
+  "cancelUrl": "/playback/requests/f1b5...",
+  "playbackAccounts": 2,
+  "activePlaybackRequests": 2
+}
+```
+
+The response also includes `Location`, `Retry-After`, `X-Playback-Queue-Position`, and `X-Playback-Request-Id` headers. The client can:
+
+- Poll `GET /playback/requests/{requestId}` for the current position. A completed poll returns the original playback response.
+- Send `DELETE /playback/requests/{requestId}` if it chooses another API, cancelling the queued or processing request.
+
+Completed, failed, and cancelled request records expire after five minutes.
+
+Example `token.json` with two playback accounts and one catalog account:
+
+```json
+[
+  {
+    "client_ID": "...",
+    "client_secret": "...",
+    "refresh_token": "paid-account-1-refresh-token",
+    "userID": "..."
+  },
+  {
+    "client_ID": "...",
+    "client_secret": "...",
+    "refresh_token": "paid-account-2-refresh-token",
+    "userID": "..."
+  },
+  {
+    "role": "catalog",
+    "client_ID": "...",
+    "client_secret": "...",
+    "refresh_token": "catalog-account-refresh-token",
+    "userID": "..."
+  }
+]
+```
+
 Run the server with:
 
 ```bash
