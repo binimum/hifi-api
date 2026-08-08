@@ -10,7 +10,7 @@
 > Music piracy is illegal in most countries. This project is intended for use with a valid Tidal account for educational purposes (for example, in your homelab). I won't provide support for people hosting this API on the open internet.
 
 > [!WARNING]
-> Tidal has begun blocking accounts en masse starting from around now - not only users using this API but also other providers such as lucide.to. There is currently no solution for this - this includes homelab users who don't expose their API to the Internet.
+> Tidal has begun blocking accounts en masse starting from around now - not only users using this API but also other providers such as lucide.to. There is currently no solution for this - this includes homelab users who don't expose their API to the Internet. **UPDATE:** you can decrease and basically nullify the risk of your account getting banned by sending one request for a track at a time from one IP at a time (and ideally avoid switching IPs too). This has been implemented in the API in the form of a queue.
 
 ## Setup
 
